@@ -1,0 +1,24 @@
+[project]
+name = "so-tactile"
+version = "0.1.0"
+description = "Tactile sensing utilities for SO-ARM experiments."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "flexitac[examples]>=0.3.1",
+]
+
+[project.scripts]
+so-tactile-heatmap = "so_tactile.heatmap:main"
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.5.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/so_tactile"]
