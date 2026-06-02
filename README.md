@@ -13,7 +13,7 @@ uv sync
 
 ## Runbook
 
-### 1. Find Port
+### 1. Find Tactile Port
 
 ```powershell
 uv run flexitac-find-port
@@ -21,7 +21,7 @@ uv run flexitac-find-port
 
 Replace `COM5` below with the detected port.
 
-### 2. Flash Firmware
+### 2. Flash Tactile Firmware
 
 Only needed when the board has not been flashed with the FlexiTac firmware yet.
 
@@ -34,25 +34,52 @@ uv run flexitac-flash --port COM5 --fqbn arduino:avr:nano:cpu=atmega328old
 For other boards or FQBNs, check the LeFlexiTac/PyFlexiTac docs and Arduino CLI
 docs linked above.
 
-### 3. Stream
+### 3. Calibrate Robot Arms
+
+Find the leader and follower ports, then calibrate both arms:
 
 ```powershell
-uv run flexitac-stream --port COM5
+uv run so-tactile robot calibrate leader --port COM4
+uv run so-tactile robot calibrate follower --port COM3
 ```
 
-`flexitac-stream` reads frames from the sensor, calibrates a baseline, and prints
-live stats such as `fps`, `raw_max`, and `norm_max`.
+Robot calibration files are written to `calibration/robot/` by default.
 
-Use a short smoke test with:
+### 4. Calibrate Tactile Baseline
+
+Always run a no-contact baseline read before recording. The tactile map drifts
+with temperature, so recalibrate if the sensor has been powered on for more than
+30 minutes.
+
+```powershell
+uv run so-tactile tactile calibrate --port COM5
+uv run so-tactile tactile status
+```
+
+Tactile baseline calibration is written to `calibration/tactile/baseline.json`
+by default.
+
+### 5. Check Tactile Readings
+
+Use the saved baseline to read a few frames and print live stats:
+
+```powershell
+uv run so-tactile tactile check --port COM5
+```
+
+`so-tactile tactile check` prints stats such as `raw_max` and `norm_max`.
+
+You can still run the upstream stream command when you want a one-off baseline
+inside that process:
 
 ```powershell
 uv run flexitac-stream --port COM5 --frames 5
 ```
 
-### 4. Heatmap
+### 6. Heatmap
 
 ```powershell
-uv run so-tactile-heatmap --port COM5
+uv run so-tactile heatmap --port COM5
 ```
 
 This local command wraps PyFlexiTac's heatmap command and sets the matplotlib

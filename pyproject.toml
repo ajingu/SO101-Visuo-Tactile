@@ -3,13 +3,14 @@ name = "so-tactile"
 version = "0.1.0"
 description = "Tactile sensing utilities for SO-ARM experiments."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "flexitac[examples]>=0.3.1",
+    "lerobot[feetech]>=0.5.1",
 ]
 
 [project.scripts]
-so-tactile-heatmap = "so_tactile.heatmap:main"
+so-tactile = "so_tactile.cli:main"
 
 [dependency-groups]
 dev = [
