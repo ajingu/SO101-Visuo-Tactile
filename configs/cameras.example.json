@@ -1,0 +1,22 @@
+{
+  "cameras": [
+    {
+      "name": "wrist",
+      "index": 0,
+      "width": 640,
+      "height": 480,
+      "fps": 15,
+      "fourcc": "MJPG",
+      "backend": "DSHOW"
+    },
+    {
+      "name": "upper",
+      "index": 1,
+      "width": 640,
+      "height": 480,
+      "fps": 15,
+      "fourcc": "MJPG",
+      "backend": "DSHOW"
+    }
+  ]
+}

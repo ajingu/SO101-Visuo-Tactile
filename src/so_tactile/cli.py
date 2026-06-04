@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import shutil
 import subprocess
 import sys
 from datetime import UTC
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -15,12 +19,27 @@ from so_tactile.heatmap import run_heatmap
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ROBOT_CALIBRATION_DIR = PROJECT_ROOT / "calibration" / "robot"
+DEFAULT_PORTS_CONFIG_PATH = PROJECT_ROOT / "configs" / "ports.json"
+DEFAULT_CAMERAS_CONFIG_PATH = PROJECT_ROOT / "configs" / "cameras.json"
+DEFAULT_DATASET_DIR = PROJECT_ROOT / "outputs" / "datasets"
+DEFAULT_TRAIN_DATASET_DIR = DEFAULT_DATASET_DIR / "train"
+DEFAULT_EVAL_DATASET_DIR = DEFAULT_DATASET_DIR / "eval"
+CV2_BACKEND_CODES = {
+    "ANY": 0,
+    "V4L2": 200,
+    "DSHOW": 700,
+    "MSMF": 1400,
+}
+DEFAULT_HEATMAP_CELL_SIZE = 25
 
 
-def run(command: list[str]) -> int:
+def run(command: list[str], *, env_overrides: dict[str, str] | None = None) -> int:
     print("+ " + " ".join(command))
+    env = os.environ.copy()
+    if env_overrides:
+        env.update(env_overrides)
     try:
-        return subprocess.run(command).returncode
+        return subprocess.run(command, env=env).returncode
     except FileNotFoundError as exc:
         print(f"Command not found: {exc.filename}", file=sys.stderr)
         return 127
@@ -29,8 +48,376 @@ def run(command: list[str]) -> int:
         return 130
 
 
-def robot_calibration_dir(value: str | None = None) -> str:
-    return value or str(DEFAULT_ROBOT_CALIBRATION_DIR)
+def run_or_print(
+    command: list[str],
+    *,
+    dry_run: bool = False,
+    env_overrides: dict[str, str] | None = None,
+) -> int:
+    if dry_run:
+        if env_overrides:
+            env_text = " ".join(f"{key}={value}" for key, value in sorted(env_overrides.items()))
+            print(f"{env_text} " + "+ " + " ".join(command))
+            return 0
+        print("+ " + " ".join(command))
+        return 0
+    return run(command, env_overrides=env_overrides)
+
+
+def load_ports_config(value: str | None = None) -> dict[str, Any]:
+    path = Path(value) if value else DEFAULT_PORTS_CONFIG_PATH
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_cameras_config(value: str | None = None) -> list[dict[str, Any]]:
+    path = Path(value) if value else DEFAULT_CAMERAS_CONFIG_PATH
+    if not path.exists():
+        return []
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    cameras = payload.get("cameras")
+    if not isinstance(cameras, list):
+        raise ValueError(f"{path} must contain a 'cameras' list")
+    return cameras
+
+
+def config_section(config: dict[str, Any], name: str) -> dict[str, Any]:
+    section = config.get(name, {})
+    return section if isinstance(section, dict) else {}
+
+
+def config_value(
+    explicit: Any,
+    config: dict[str, Any],
+    section: str,
+    key: str,
+    default: Any = None,
+) -> Any:
+    if explicit is not None:
+        return explicit
+    return config_section(config, section).get(key, default)
+
+
+def tactile_config_baud(ports_config: dict[str, Any]) -> int | None:
+    value = config_section(ports_config, "tactile").get("baud_rate")
+    return int(value) if value is not None else None
+
+
+def tactile_heatmap_cell_size(ports_config: dict[str, Any]) -> int:
+    value = config_section(ports_config, "tactile").get("heatmap_cell_size")
+    return int(value) if value is not None else DEFAULT_HEATMAP_CELL_SIZE
+
+
+def lerobot_command(command: str) -> list[str]:
+    return [sys.executable, "-m", "so_tactile.lerobot_run", command]
+
+
+def lerobot_env(
+    ports_config: dict[str, Any],
+    args: argparse.Namespace | None = None,
+) -> dict[str, str]:
+    cell_size = getattr(args, "heatmap_cell_size", None) or tactile_heatmap_cell_size(ports_config)
+    follower_config = config_section(ports_config, "follower")
+    park_on_exit = config_bool(follower_config.get("park_on_exit"), True)
+    if getattr(args, "park_on_exit", None) is False:
+        park_on_exit = False
+    park_duration_s = getattr(args, "park_duration_s", None) or follower_config.get(
+        "park_duration_s",
+        3.0,
+    )
+
+    env = {
+        "SO_TACTILE_HEATMAP_CELL_SIZE": str(cell_size),
+        "SO101_PARK_ON_EXIT": str(park_on_exit).lower(),
+        "SO101_PARK_DURATION_S": str(park_duration_s),
+    }
+    park_pose = follower_config.get("park_pose")
+    if park_pose is not None:
+        env["SO101_PARK_POSE"] = json.dumps(park_pose)
+    return env
+
+
+def require_value(value: Any, name: str) -> Any:
+    if value in (None, ""):
+        raise ValueError(f"Missing {name}. Set it in configs/ports.json or pass the CLI flag.")
+    return value
+
+
+def config_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def robot_calibration_dir(
+    value: str | None = None,
+    ports_config: dict[str, Any] | None = None,
+) -> str:
+    if value:
+        return value
+    if ports_config and ports_config.get("calibration_dir"):
+        path = Path(ports_config["calibration_dir"])
+        return str(path if path.is_absolute() else PROJECT_ROOT / path)
+    return str(DEFAULT_ROBOT_CALIBRATION_DIR)
+
+
+def dataset_root_for_repo(repo_id: str) -> Path:
+    _, _, name = repo_id.rpartition("/")
+    if name.startswith("eval_"):
+        return DEFAULT_EVAL_DATASET_DIR
+    return DEFAULT_TRAIN_DATASET_DIR
+
+
+def lerobot_dataset_path(repo_id: str, dataset_root: str | None = None) -> Path:
+    root = Path(dataset_root) if dataset_root else dataset_root_for_repo(repo_id)
+    return root / Path(repo_id)
+
+
+def remove_existing_dataset(
+    repo_id: str,
+    dataset_root: str | None = None,
+    *,
+    dry_run: bool = False,
+) -> None:
+    dataset_path = lerobot_dataset_path(repo_id, dataset_root).resolve()
+    dataset_root_path = DEFAULT_DATASET_DIR.resolve()
+
+    if dataset_root is not None:
+        requested_root = Path(dataset_root).resolve()
+        if requested_root != dataset_path and requested_root not in dataset_path.parents:
+            raise RuntimeError(f"Refusing to remove path outside requested dataset root: {dataset_path}")
+    elif dataset_root_path != dataset_path and dataset_root_path not in dataset_path.parents:
+        raise RuntimeError(f"Refusing to remove path outside project datasets: {dataset_path}")
+
+    if dataset_path.exists():
+        if dry_run:
+            print(f"Would remove existing local dataset: {dataset_path}")
+            return
+        print(f"Removing existing local dataset: {dataset_path}")
+        shutil.rmtree(dataset_path)
+
+
+def find_lerobot_dataset_path(repo_id: str) -> Path:
+    preferred_path = lerobot_dataset_path(repo_id)
+    if preferred_path.exists():
+        return preferred_path
+
+    candidates = [
+        DEFAULT_TRAIN_DATASET_DIR / Path(repo_id),
+        DEFAULT_EVAL_DATASET_DIR / Path(repo_id),
+        DEFAULT_DATASET_DIR / Path(repo_id),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    return preferred_path
+
+
+def eval_repo_id(repo_id: str) -> str:
+    namespace, separator, name = repo_id.rpartition("/")
+    if name.startswith("eval_"):
+        return repo_id
+    eval_name = f"eval_{name}"
+    return f"{namespace}{separator}{eval_name}" if separator else eval_name
+
+
+def tactile_sensors_arg(
+    name: str,
+    port: str,
+    baud_rate: int,
+    *,
+    enable_visualization: bool = True,
+) -> str:
+    sensor_config = json.dumps(
+        {
+            "port": port,
+            "baud_rate": baud_rate,
+            "enable_visualization": enable_visualization,
+        }
+    )
+    return f"{{{name}: {sensor_config}}}"
+
+
+def cv2_backend_code(backend: int | str | None) -> int | None:
+    if backend is None:
+        return None
+    if isinstance(backend, int):
+        return backend
+
+    backend_text = backend.strip().upper()
+    if backend_text.isdigit():
+        return int(backend_text)
+    backend_text = backend_text.removeprefix("CAP_")
+    if backend_text in CV2_BACKEND_CODES:
+        return CV2_BACKEND_CODES[backend_text]
+    raise ValueError(f"Unsupported OpenCV backend: {backend}")
+
+
+def lerobot_cameras_arg(cameras: list[dict[str, Any]]) -> str | None:
+    if not cameras:
+        return None
+
+    camera_items = []
+    for camera in cameras:
+        name = str(camera["name"])
+        index_or_path = camera.get("index_or_path", camera.get("index"))
+        if index_or_path is None:
+            raise ValueError(f"Camera {name!r} must define 'index' or 'index_or_path'")
+
+        fields = [
+            f"type: {camera.get('type', 'opencv')}",
+            f"index_or_path: {index_or_path}",
+            f"width: {int(camera.get('width', 640))}",
+            f"height: {int(camera.get('height', 480))}",
+            f"fps: {int(camera.get('fps', 30))}",
+        ]
+        if camera.get("fourcc") is not None:
+            fields.append(f"fourcc: {camera['fourcc']}")
+        backend = cv2_backend_code(camera.get("backend"))
+        if backend is not None:
+            fields.append(f"backend: {backend}")
+        for optional_key in ("color_mode", "rotation", "warmup_s"):
+            if camera.get(optional_key) is not None:
+                fields.append(f"{optional_key}: {camera[optional_key]}")
+
+        camera_items.append(f"{name}: {{" + ", ".join(fields) + "}")
+
+    return "{ " + ", ".join(camera_items) + " }"
+
+
+def robot_cameras_arg(args: argparse.Namespace) -> str | None:
+    if args.no_cameras:
+        return None
+    if args.robot_cameras:
+        return args.robot_cameras
+    return lerobot_cameras_arg(load_cameras_config(args.cameras_config))
+
+
+def add_ports_config_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--ports-config", default=str(DEFAULT_PORTS_CONFIG_PATH))
+
+
+def add_cameras_config_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--cameras-config", default=str(DEFAULT_CAMERAS_CONFIG_PATH))
+    parser.add_argument("--robot-cameras")
+    parser.add_argument("--no-cameras", action="store_true")
+
+
+def add_robot_port_args(parser: argparse.ArgumentParser, *, include_tactile: bool = True) -> None:
+    add_ports_config_arg(parser)
+    parser.add_argument("--leader-port")
+    parser.add_argument("--follower-port")
+    parser.add_argument("--leader-id")
+    parser.add_argument("--follower-id")
+    parser.add_argument("--calibration-dir")
+    if include_tactile:
+        parser.add_argument("--tactile-port")
+        parser.add_argument("--tactile-name")
+        parser.add_argument("--tactile-baud-rate", type=int)
+        parser.add_argument("--no-tactile", action="store_true")
+        parser.add_argument("--no-heatmap", action="store_true")
+        parser.add_argument("--heatmap-cell-size", type=int)
+    parser.add_argument("--no-park-on-exit", action="store_false", dest="park_on_exit")
+    parser.add_argument("--park-duration-s", type=float)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.set_defaults(park_on_exit=True)
+
+
+def base_robot_args(
+    args: argparse.Namespace,
+    *,
+    ports_config: dict[str, Any],
+    include_leader: bool,
+    include_tactile: bool,
+) -> list[str]:
+    command = []
+    calib_dir = robot_calibration_dir(args.calibration_dir, ports_config)
+
+    if include_leader:
+        leader_port = require_value(
+            config_value(args.leader_port, ports_config, "leader", "port"),
+            "leader port",
+        )
+        leader_id = config_value(args.leader_id, ports_config, "leader", "id", "leader")
+        command.extend(
+            [
+                "--teleop.type=so101_leader",
+                f"--teleop.port={leader_port}",
+                f"--teleop.id={leader_id}",
+                f"--teleop.calibration_dir={calib_dir}",
+            ]
+        )
+
+    follower_port = require_value(
+        config_value(args.follower_port, ports_config, "follower", "port"),
+        "follower port",
+    )
+    follower_id = config_value(args.follower_id, ports_config, "follower", "id", "follower")
+    command.extend(
+        [
+            "--robot.type=so_tactile_follower",
+            f"--robot.port={follower_port}",
+            f"--robot.id={follower_id}",
+            f"--robot.calibration_dir={calib_dir}",
+        ]
+    )
+
+    if include_tactile and not args.no_tactile:
+        tactile_port = require_value(
+            config_value(args.tactile_port, ports_config, "tactile", "port"),
+            "tactile port",
+        )
+        tactile_name = config_value(args.tactile_name, ports_config, "tactile", "name", "primary")
+        tactile_baud = int(
+            config_value(args.tactile_baud_rate, ports_config, "tactile", "baud_rate", 2_000_000)
+        )
+        enable_visualization = config_bool(
+            config_section(ports_config, "tactile").get("enable_visualization"),
+            True,
+        )
+        if args.no_heatmap:
+            enable_visualization = False
+        command.append(
+            "--robot.tactile_sensors="
+            f"{tactile_sensors_arg(tactile_name, tactile_port, tactile_baud, enable_visualization=enable_visualization)}"
+        )
+
+    return command
+
+
+def add_tactile_sensor_arg_from_config(
+    command: list[str],
+    args: argparse.Namespace,
+    ports_config: dict[str, Any],
+) -> None:
+    if args.no_tactile:
+        return
+
+    tactile_port = require_value(
+        config_value(args.tactile_port, ports_config, "tactile", "port"),
+        "tactile port",
+    )
+    tactile_name = config_value(args.tactile_name, ports_config, "tactile", "name", "primary")
+    tactile_baud = int(
+        config_value(args.tactile_baud_rate, ports_config, "tactile", "baud_rate", 2_000_000)
+    )
+    enable_visualization = config_bool(
+        config_section(ports_config, "tactile").get("enable_visualization"),
+        True,
+    )
+    if args.no_heatmap:
+        enable_visualization = False
+    command.append(
+        "--robot.tactile_sensors="
+        f"{tactile_sensors_arg(tactile_name, tactile_port, tactile_baud, enable_visualization=enable_visualization)}"
+    )
 
 
 def calibrate_robot(
@@ -39,51 +426,65 @@ def calibrate_robot(
     port: str,
     robot_id: str | None = None,
     calibration_dir_value: str | None = None,
+    ports_config: dict[str, Any] | None = None,
+    dry_run: bool = False,
 ) -> int:
     robot_id = robot_id or role
-    calib_dir = robot_calibration_dir(calibration_dir_value)
+    calib_dir = robot_calibration_dir(calibration_dir_value, ports_config)
 
     if role == "leader":
-        return run(
+        return run_or_print(
             [
                 "lerobot-calibrate",
                 "--teleop.type=so101_leader",
                 f"--teleop.port={port}",
                 f"--teleop.id={robot_id}",
                 f"--teleop.calibration_dir={calib_dir}",
-            ]
+            ],
+            dry_run=dry_run,
         )
 
-    return run(
+    return run_or_print(
         [
             "lerobot-calibrate",
-            "--robot.type=so101_follower",
+            "--robot.type=so_tactile_follower",
             f"--robot.port={port}",
             f"--robot.id={robot_id}",
             f"--robot.calibration_dir={calib_dir}",
-        ]
+        ],
+        dry_run=dry_run,
     )
 
 
 def robot_calibrate_command(args: argparse.Namespace) -> int:
+    ports_config = load_ports_config(args.ports_config)
+    role_config = config_section(ports_config, args.role)
     return calibrate_robot(
         args.role,
-        port=args.port,
-        robot_id=args.id,
+        port=require_value(args.port or role_config.get("port"), f"{args.role} port"),
+        robot_id=args.id or role_config.get("id"),
         calibration_dir_value=args.calibration_dir,
+        ports_config=ports_config,
+        dry_run=args.dry_run,
     )
 
 
 def heatmap_command(args: argparse.Namespace) -> int:
+    ports_config = load_ports_config(args.ports_config)
+    port = require_value(
+        args.port or config_section(ports_config, "tactile").get("port"),
+        "tactile port",
+    )
+    baud = args.baud or tactile_config_baud(ports_config) or 2_000_000
     argv = [
         "--port",
-        args.port,
+        port,
         "--rows",
         str(args.rows),
         "--cols",
         str(args.cols),
         "--baud",
-        str(args.baud),
+        str(baud),
         "--cmap",
         args.cmap,
     ]
@@ -97,14 +498,21 @@ def tactile_baseline_path(value: str | None = None) -> Path:
 def tactile_calibrate_command(args: argparse.Namespace) -> int:
     from flexitac import FlexiTacSensor
 
+    ports_config = load_ports_config(args.ports_config)
+    port = require_value(
+        args.port or config_section(ports_config, "tactile").get("port"),
+        "tactile port",
+    )
+    baud = args.baud or tactile_config_baud(ports_config) or 2_000_000
+
     if not args.no_prompt:
         input("Keep the tactile sensor unloaded/no-contact, then press Enter to calibrate... ")
 
     sensor = FlexiTacSensor(
-        args.port,
+        port,
         rows=args.rows,
         cols=args.cols,
-        baud=args.baud,
+        baud=baud,
         threshold=args.threshold,
         noise_scale=args.noise_scale,
         init_frames=args.frames,
@@ -117,7 +525,7 @@ def tactile_calibrate_command(args: argparse.Namespace) -> int:
         baseline,
         rows=args.rows,
         cols=args.cols,
-        baud=args.baud,
+        baud=baud,
         frames=args.frames,
     )
     print(f"Saved tactile baseline: {output_path}")
@@ -142,14 +550,19 @@ def tactile_status_command(args: argparse.Namespace) -> int:
 def tactile_check_command(args: argparse.Namespace) -> int:
     from flexitac import FlexiTacSensor
 
+    ports_config = load_ports_config(args.ports_config)
+    port = require_value(
+        args.port or config_section(ports_config, "tactile").get("port"),
+        "tactile port",
+    )
     baseline_path = tactile_baseline_path(args.baseline_path)
     saved = calibration.load_tactile_baseline(baseline_path, rows=args.rows, cols=args.cols)
     rows = args.rows or saved.rows
     cols = args.cols or saved.cols
-    baud = args.baud or saved.baud
+    baud = args.baud or tactile_config_baud(ports_config) or saved.baud
 
     sensor = FlexiTacSensor(
-        args.port,
+        port,
         rows=rows,
         cols=cols,
         baud=baud,
@@ -169,10 +582,209 @@ def tactile_check_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def teleop_command(args: argparse.Namespace) -> int:
+    ports_config = load_ports_config(args.ports_config)
+    cameras_arg = robot_cameras_arg(args)
+    command = [
+        *lerobot_command("teleoperate"),
+        *base_robot_args(
+            args,
+            ports_config=ports_config,
+            include_leader=True,
+            include_tactile=not args.no_tactile,
+        ),
+        f"--fps={args.fps}",
+        f"--display_data={str(args.display_data).lower()}",
+    ]
+    if cameras_arg:
+        command.append(f"--robot.cameras={cameras_arg}")
+    if args.max_relative_target is not None:
+        command.append(f"--robot.max_relative_target={args.max_relative_target}")
+    return run_or_print(command, dry_run=args.dry_run, env_overrides=lerobot_env(ports_config, args))
+
+
+def record_command(args: argparse.Namespace) -> int:
+    ports_config = load_ports_config(args.ports_config)
+    cameras_arg = robot_cameras_arg(args)
+    dataset_path = lerobot_dataset_path(args.repo_id, args.dataset_root)
+    if args.overwrite:
+        if args.resume:
+            raise ValueError("--overwrite and --resume cannot be used together")
+        remove_existing_dataset(args.repo_id, args.dataset_root, dry_run=args.dry_run)
+    command = [
+        *lerobot_command("record"),
+        *base_robot_args(
+            args,
+            ports_config=ports_config,
+            include_leader=True,
+            include_tactile=not args.no_tactile,
+        ),
+        f"--display_data={str(args.display_data).lower()}",
+        "--play_sounds=false",
+        f"--dataset.repo_id={args.repo_id}",
+        f"--dataset.root={dataset_path}",
+        f"--dataset.num_episodes={args.episodes}",
+        f"--dataset.episode_time_s={args.episode_time_s}",
+        f"--dataset.reset_time_s={args.reset_time_s}",
+        f"--dataset.single_task={args.task}",
+        f"--dataset.fps={args.fps}",
+        f"--dataset.push_to_hub={str(args.push_to_hub).lower()}",
+        f"--dataset.streaming_encoding={str(args.streaming_encoding).lower()}",
+        f"--dataset.encoder_threads={args.encoder_threads}",
+        f"--dataset.vcodec={args.vcodec}",
+    ]
+    if cameras_arg:
+        command.append(f"--robot.cameras={cameras_arg}")
+    if args.resume:
+        command.append("--resume=true")
+    return run_or_print(command, dry_run=args.dry_run, env_overrides=lerobot_env(ports_config, args))
+
+
+def rollout_command(args: argparse.Namespace) -> int:
+    ports_config = load_ports_config(args.ports_config)
+    cameras_arg = robot_cameras_arg(args)
+    repo_id = eval_repo_id(args.repo_id)
+    if repo_id != args.repo_id:
+        print(f"Using eval repo_id: {repo_id}")
+    dataset_path = lerobot_dataset_path(repo_id, args.dataset_root)
+    if args.overwrite:
+        remove_existing_dataset(repo_id, args.dataset_root, dry_run=args.dry_run)
+    command = [
+        *lerobot_command("record"),
+        *base_robot_args(
+            args,
+            ports_config=ports_config,
+            include_leader=args.with_teleop,
+            include_tactile=not args.no_tactile,
+        ),
+        f"--display_data={str(args.display_data).lower()}",
+        "--play_sounds=false",
+        f"--dataset.repo_id={repo_id}",
+        f"--dataset.root={dataset_path}",
+        f"--dataset.num_episodes={args.episodes}",
+        f"--dataset.episode_time_s={args.episode_time_s}",
+        f"--dataset.reset_time_s={args.reset_time_s}",
+        f"--dataset.single_task={args.task}",
+        f"--dataset.fps={args.fps}",
+        "--dataset.push_to_hub=false",
+        f"--policy.path={args.policy_path}",
+    ]
+    if cameras_arg:
+        command.append(f"--robot.cameras={cameras_arg}")
+    if args.device:
+        command.append(f"--policy.device={args.device}")
+    if args.use_amp is not None:
+        command.append(f"--policy.use_amp={str(args.use_amp).lower()}")
+    return run_or_print(command, dry_run=args.dry_run, env_overrides=lerobot_env(ports_config, args))
+
+
+def replay_command(args: argparse.Namespace) -> int:
+    ports_config = load_ports_config(args.ports_config)
+    follower_port = require_value(
+        config_value(args.follower_port, ports_config, "follower", "port"),
+        "follower port",
+    )
+    follower_id = config_value(args.follower_id, ports_config, "follower", "id", "follower")
+    calib_dir = robot_calibration_dir(args.calibration_dir, ports_config)
+    dataset_path = lerobot_dataset_path(args.repo_id, args.dataset_root)
+    command = [
+        *lerobot_command("replay"),
+        "--robot.type=so_tactile_follower",
+        f"--robot.port={follower_port}",
+        f"--robot.id={follower_id}",
+        f"--robot.calibration_dir={calib_dir}",
+        f"--dataset.repo_id={args.repo_id}",
+        f"--dataset.root={dataset_path}",
+        f"--dataset.episode={args.episode}",
+    ]
+    add_tactile_sensor_arg_from_config(command, args, ports_config)
+    return run_or_print(command, dry_run=args.dry_run, env_overrides=lerobot_env(ports_config, args))
+
+
+def dataset_path_command(args: argparse.Namespace) -> int:
+    print(find_lerobot_dataset_path(args.repo_id))
+    return 0
+
+
+def dataset_info_command(args: argparse.Namespace) -> int:
+    dataset_path = find_lerobot_dataset_path(args.repo_id)
+    info_path = dataset_path / "meta" / "info.json"
+    if not info_path.exists():
+        print(f"Dataset info not found: {info_path}")
+        return 1
+
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    features = info.get("features", {})
+    tactile_keys = [key for key in features if key.startswith("observation.tactile.")]
+    video_keys = [
+        key for key, value in features.items()
+        if isinstance(value, dict) and value.get("dtype") == "video"
+    ]
+
+    print(f"repo_id: {args.repo_id}")
+    print(f"path: {dataset_path}")
+    print(f"total_episodes: {info.get('total_episodes')}")
+    print(f"total_frames: {info.get('total_frames')}")
+    print(f"fps: {info.get('fps')}")
+    print(f"features: {', '.join(features)}")
+    print(f"tactile_keys: {', '.join(tactile_keys) or 'none'}")
+    print(f"video_keys: {', '.join(video_keys) or 'none'}")
+    return 0
+
+
+def cameras_arg_command(args: argparse.Namespace) -> int:
+    cameras_arg = lerobot_cameras_arg(load_cameras_config(args.cameras_config))
+    if cameras_arg is None:
+        print(f"No cameras configured: {args.cameras_config}")
+        return 1
+    print(cameras_arg)
+    return 0
+
+
+def cameras_check_command(args: argparse.Namespace) -> int:
+    import cv2
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cameras = load_cameras_config(args.cameras_config)
+    if not cameras:
+        print(f"No cameras configured: {args.cameras_config}")
+        return 1
+
+    failures = 0
+    for camera in cameras:
+        name = str(camera["name"])
+        index_or_path = camera.get("index_or_path", camera.get("index"))
+        backend = cv2_backend_code(camera.get("backend"))
+        cap = cv2.VideoCapture(index_or_path, backend if backend is not None else cv2.CAP_ANY)
+        if camera.get("fourcc") is not None:
+            fourcc = str(camera["fourcc"])
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(camera.get("width", 640)))
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(camera.get("height", 480)))
+        cap.set(cv2.CAP_PROP_FPS, int(camera.get("fps", 30)))
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            print(f"{name}: failed to read from camera {index_or_path}")
+            failures += 1
+            cap.release()
+            continue
+
+        image_path = output_dir / f"{name}.jpg"
+        cv2.imwrite(str(image_path), frame)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        print(f"{name}: {width}x{height} @ {fps:.1f} fps, snapshot={image_path}")
+        cap.release()
+
+    return 1 if failures else 0
+
+
 def add_common_tactile_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rows", type=int, default=12)
     parser.add_argument("--cols", type=int, default=32)
-    parser.add_argument("--baud", type=int, default=2_000_000)
+    parser.add_argument("--baud", type=int)
     parser.add_argument("--threshold", type=float, default=25.0)
     parser.add_argument("--noise-scale", type=float, default=30.0)
     parser.add_argument("--baseline-path")
@@ -183,10 +795,11 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     heatmap_parser = subparsers.add_parser("heatmap")
-    heatmap_parser.add_argument("--port", required=True)
+    add_ports_config_arg(heatmap_parser)
+    heatmap_parser.add_argument("--port")
     heatmap_parser.add_argument("--rows", type=int, default=12)
     heatmap_parser.add_argument("--cols", type=int, default=32)
-    heatmap_parser.add_argument("--baud", type=int, default=2_000_000)
+    heatmap_parser.add_argument("--baud", type=int)
     heatmap_parser.add_argument("--cmap", default="viridis")
     heatmap_parser.set_defaults(func=heatmap_command)
 
@@ -194,16 +807,19 @@ def build_parser() -> argparse.ArgumentParser:
     robot_subparsers = robot_parser.add_subparsers(dest="robot_command")
     robot_calibrate_parser = robot_subparsers.add_parser("calibrate")
     robot_calibrate_parser.add_argument("role", choices=["leader", "follower"])
-    robot_calibrate_parser.add_argument("--port", required=True)
+    add_ports_config_arg(robot_calibrate_parser)
+    robot_calibrate_parser.add_argument("--port")
     robot_calibrate_parser.add_argument("--id")
     robot_calibrate_parser.add_argument("--calibration-dir")
+    robot_calibrate_parser.add_argument("--dry-run", action="store_true")
     robot_calibrate_parser.set_defaults(func=robot_calibrate_command)
 
     tactile_parser = subparsers.add_parser("tactile")
     tactile_subparsers = tactile_parser.add_subparsers(dest="tactile_command")
 
     tactile_calibrate_parser = tactile_subparsers.add_parser("calibrate")
-    tactile_calibrate_parser.add_argument("--port", required=True)
+    add_ports_config_arg(tactile_calibrate_parser)
+    tactile_calibrate_parser.add_argument("--port")
     add_common_tactile_args(tactile_calibrate_parser)
     tactile_calibrate_parser.add_argument("--frames", type=int, default=30)
     tactile_calibrate_parser.add_argument("--no-prompt", action="store_true")
@@ -214,7 +830,8 @@ def build_parser() -> argparse.ArgumentParser:
     tactile_status_parser.set_defaults(func=tactile_status_command)
 
     tactile_check_parser = tactile_subparsers.add_parser("check")
-    tactile_check_parser.add_argument("--port", required=True)
+    add_ports_config_arg(tactile_check_parser)
+    tactile_check_parser.add_argument("--port")
     tactile_check_parser.add_argument("--rows", type=int)
     tactile_check_parser.add_argument("--cols", type=int)
     tactile_check_parser.add_argument("--baud", type=int)
@@ -223,6 +840,105 @@ def build_parser() -> argparse.ArgumentParser:
     tactile_check_parser.add_argument("--baseline-path")
     tactile_check_parser.add_argument("--frames", type=int, default=5)
     tactile_check_parser.set_defaults(func=tactile_check_command)
+
+    teleop_parser = subparsers.add_parser("teleop")
+    add_robot_port_args(teleop_parser)
+    add_cameras_config_args(teleop_parser)
+    teleop_parser.add_argument("--fps", type=int, default=60)
+    teleop_parser.add_argument("--max-relative-target", type=float)
+    display_group = teleop_parser.add_mutually_exclusive_group()
+    display_group.add_argument("--display-data", action="store_true", dest="display_data")
+    display_group.add_argument("--no-display-data", action="store_false", dest="display_data")
+    teleop_parser.set_defaults(display_data=False)
+    teleop_parser.set_defaults(func=teleop_command)
+
+    record_parser = subparsers.add_parser("record")
+    add_robot_port_args(record_parser)
+    add_cameras_config_args(record_parser)
+    record_parser.add_argument("--repo-id", required=True)
+    record_parser.add_argument("--task", default="Pick up the object")
+    record_parser.add_argument("--dataset-root")
+    record_parser.add_argument("--episodes", type=int, default=2)
+    record_parser.add_argument("--episode-time-s", type=int, default=30)
+    record_parser.add_argument("--reset-time-s", type=int, default=15)
+    record_parser.add_argument("--fps", type=int, default=30)
+    record_parser.add_argument("--encoder-threads", type=int, default=2)
+    record_parser.add_argument("--vcodec", default="h264_nvenc")
+    record_parser.add_argument("--push-to-hub", action="store_true")
+    record_parser.add_argument("--resume", action="store_true")
+    record_parser.add_argument("--overwrite", action="store_true")
+    record_parser.add_argument("--no-streaming-encoding", action="store_false", dest="streaming_encoding")
+    display_group = record_parser.add_mutually_exclusive_group()
+    display_group.add_argument("--display-data", action="store_true", dest="display_data")
+    display_group.add_argument("--no-display-data", action="store_false", dest="display_data")
+    record_parser.set_defaults(display_data=True)
+    record_parser.set_defaults(streaming_encoding=True)
+    record_parser.set_defaults(func=record_command)
+
+    rollout_parser = subparsers.add_parser("rollout")
+    add_robot_port_args(rollout_parser)
+    add_cameras_config_args(rollout_parser)
+    rollout_parser.add_argument("--policy-path", required=True)
+    rollout_parser.add_argument("--repo-id", required=True)
+    rollout_parser.add_argument("--task", default="Pick up the object")
+    rollout_parser.add_argument("--dataset-root")
+    rollout_parser.add_argument("--episodes", type=int, default=3)
+    rollout_parser.add_argument("--episode-time-s", type=int, default=30)
+    rollout_parser.add_argument("--reset-time-s", type=int, default=15)
+    rollout_parser.add_argument("--fps", type=int, default=30)
+    rollout_parser.add_argument("--with-teleop", action="store_true")
+    rollout_parser.add_argument("--overwrite", action="store_true")
+    rollout_parser.add_argument("--device", default="cuda")
+    rollout_parser.add_argument("--no-use-amp", action="store_false", dest="use_amp")
+    display_group = rollout_parser.add_mutually_exclusive_group()
+    display_group.add_argument("--display-data", action="store_true", dest="display_data")
+    display_group.add_argument("--no-display-data", action="store_false", dest="display_data")
+    rollout_parser.set_defaults(display_data=True)
+    rollout_parser.set_defaults(use_amp=True)
+    rollout_parser.set_defaults(func=rollout_command)
+
+    replay_parser = subparsers.add_parser("replay")
+    add_ports_config_arg(replay_parser)
+    replay_parser.add_argument("--follower-port")
+    replay_parser.add_argument("--follower-id")
+    replay_parser.add_argument("--calibration-dir")
+    replay_parser.add_argument("--tactile-port")
+    replay_parser.add_argument("--tactile-name")
+    replay_parser.add_argument("--tactile-baud-rate", type=int)
+    replay_parser.add_argument("--no-tactile", action="store_true")
+    replay_parser.add_argument("--no-heatmap", action="store_true")
+    replay_parser.add_argument("--heatmap-cell-size", type=int)
+    replay_parser.add_argument("--no-park-on-exit", action="store_false", dest="park_on_exit")
+    replay_parser.add_argument("--park-duration-s", type=float)
+    replay_parser.add_argument("--repo-id", required=True)
+    replay_parser.add_argument("--dataset-root")
+    replay_parser.add_argument("--episode", type=int, default=0)
+    replay_parser.add_argument("--dry-run", action="store_true")
+    replay_parser.set_defaults(park_on_exit=True)
+    replay_parser.set_defaults(func=replay_command)
+
+    dataset_path_parser = subparsers.add_parser("dataset-path")
+    dataset_path_parser.add_argument("--repo-id", required=True)
+    dataset_path_parser.set_defaults(func=dataset_path_command)
+
+    dataset_info_parser = subparsers.add_parser("dataset-info")
+    dataset_info_parser.add_argument("--repo-id", required=True)
+    dataset_info_parser.set_defaults(func=dataset_info_command)
+
+    cameras_parser = subparsers.add_parser("cameras")
+    cameras_subparsers = cameras_parser.add_subparsers(dest="cameras_command")
+
+    cameras_arg_parser = cameras_subparsers.add_parser("arg")
+    cameras_arg_parser.add_argument("--cameras-config", default=str(DEFAULT_CAMERAS_CONFIG_PATH))
+    cameras_arg_parser.set_defaults(func=cameras_arg_command)
+
+    cameras_check_parser = cameras_subparsers.add_parser("check")
+    cameras_check_parser.add_argument("--cameras-config", default=str(DEFAULT_CAMERAS_CONFIG_PATH))
+    cameras_check_parser.add_argument(
+        "--output-dir",
+        default=str(PROJECT_ROOT / "outputs" / "camera_checks"),
+    )
+    cameras_check_parser.set_defaults(func=cameras_check_command)
 
     return parser
 
@@ -233,4 +949,8 @@ def main(argv: list[str] | None = None) -> int:
     if not hasattr(args, "func"):
         parser.print_help()
         return 0
-    return args.func(args)
+    try:
+        return args.func(args)
+    except (RuntimeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2

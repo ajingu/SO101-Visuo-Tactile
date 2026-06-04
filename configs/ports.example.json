@@ -1,0 +1,20 @@
+{
+  "leader": {
+    "port": "COM4",
+    "id": "leader"
+  },
+  "follower": {
+    "port": "COM3",
+    "id": "follower",
+    "park_on_exit": true,
+    "park_duration_s": 3.0
+  },
+  "tactile": {
+    "port": "COM5",
+    "name": "primary",
+    "baud_rate": 2000000,
+    "enable_visualization": true,
+    "heatmap_cell_size": 25
+  },
+  "calibration_dir": "calibration/robot"
+}

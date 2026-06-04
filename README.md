@@ -11,6 +11,29 @@ following the LeFlexiTac/PyFlexiTac docs linked below.
 uv sync
 ```
 
+Create a local port config:
+
+```powershell
+New-Item -ItemType Directory -Force configs
+Copy-Item configs/ports.example.json configs/ports.json
+Copy-Item configs/cameras.example.json configs/cameras.json
+```
+
+Edit `configs/ports.json` for your leader, follower, and tactile sensor ports.
+All hardware commands read this file by default. You can still override any port
+with CLI flags such as `--leader-port`, `--follower-port`, or `--tactile-port`.
+Set `tactile.enable_visualization` to `false` if you do not want the live
+tactile heatmap window by default.
+Adjust `tactile.heatmap_cell_size` if the heatmap window is too large or too
+small.
+Set `follower.park_on_exit` to `true` to return the follower arm to the park
+pose before torque is disabled on exit. The default command behavior enables
+this and uses `follower.park_duration_s` seconds.
+
+Edit `configs/cameras.json` for your USB camera indices and names. `teleop`,
+`record`, and `rollout` read this file by default and pass it to LeRobot as
+`--robot.cameras`. Use `--no-cameras` for a robot/tactile-only run.
+
 ## Runbook
 
 ### 1. Find Tactile Port
@@ -84,6 +107,83 @@ uv run so-tactile heatmap --port COM5
 
 This local command wraps PyFlexiTac's heatmap command and sets the matplotlib
 cache directory automatically for Windows.
+
+### 7. Teleoperate
+
+With `configs/ports.json` configured:
+
+```powershell
+uv run so-tactile teleop
+```
+
+With `configs/cameras.json` present, teleop attaches the configured cameras to
+the robot. Pass `--display-data` only when you want LeRobot/Rerun display; by
+default, teleop keeps LeRobot's joint-value table hidden.
+
+To override ports at the command line:
+
+```powershell
+uv run so-tactile teleop --leader-port COM4 --follower-port COM3 --tactile-port COM5
+```
+
+### 8. Record A Tactile Dataset
+
+```powershell
+uv run so-tactile record `
+  --repo-id local/tactile-smoke `
+  --task "Pick up the object" `
+  --episodes 1 `
+  --episode-time-s 10 `
+  --reset-time-s 5
+```
+
+The command uses LeFlexiTac's `so_tactile_follower` robot and writes
+`observation.tactile.primary` by passing `--robot.tactile_sensors` to
+`lerobot-record`.
+
+`teleop`, `record`, and `replay` show a live tactile heatmap from the same
+LeRobot tactile stream by default. Add `--no-heatmap` to disable the preview for
+one run, or `--heatmap-cell-size 20` to change its size for one run.
+
+On exit, the follower arm moves back to the park pose before disconnecting. Use
+`--park-duration-s 5` for a slower return, or `--no-park-on-exit` if you need
+the old immediate disconnect behavior.
+
+With `configs/cameras.json` present, `record` also saves camera video features.
+Check the camera config before recording:
+
+```powershell
+uv run so-tactile cameras arg
+uv run so-tactile cameras check
+```
+
+Inspect the dataset:
+
+```powershell
+uv run so-tactile dataset-path --repo-id local/tactile-smoke
+uv run so-tactile dataset-info --repo-id local/tactile-smoke
+```
+
+Training datasets are stored under `outputs/datasets/train/`.
+
+### 9. Rollout / Eval Record
+
+```powershell
+uv run so-tactile rollout `
+  --policy-path outputs/train/my_policy/checkpoints/last/pretrained_model `
+  --repo-id local/eval_tactile-smoke `
+  --task "Pick up the object" `
+  --episodes 1
+```
+
+Eval datasets are stored under `outputs/datasets/eval/`. If the repo name does
+not start with `eval_`, `so-tactile rollout` adds it automatically.
+
+Replay an episode on the follower:
+
+```powershell
+uv run so-tactile replay --repo-id local/tactile-smoke --episode 0
+```
 
 ## Development
 

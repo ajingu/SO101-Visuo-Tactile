@@ -2,3 +2,6 @@
 .uv-cache/
 .matplotlib/
 __pycache__/
+configs/ports.json
+configs/cameras.json
+outputs/
