@@ -1,6 +1,12 @@
-# SO Tactile
+# SO-ARM x Tactile Sensing
 
-Minimal `uv` project for FlexiTac-based tactile sensing experiments with SO-ARM.
+SO-ARM visuo-tactile sensing with [FlexiTac](https://flexitac.github.io/).
+
+This repository focuses on wiring the SO-ARM follower, USB camera, and FlexiTac
+sensor into a simple capture and replay workflow. It records synchronized
+visual and tactile observations, shows live heatmaps while operating the arm,
+and lets you replay the saved visual/tactile data afterward for screenshots or
+short demo clips. Model training is left as future work.
 
 ## Setup
 
@@ -30,9 +36,9 @@ Set `follower.park_on_exit` to `true` to return the follower arm to the park
 pose before torque is disabled on exit. The default command behavior enables
 this and uses `follower.park_duration_s` seconds.
 
-Edit `configs/cameras.json` for your USB camera indices and names. `teleop`,
-`record`, and `rollout` read this file by default and pass it to LeRobot as
-`--robot.cameras`. Use `--no-cameras` for a robot/tactile-only run.
+Edit `configs/cameras.json` for your USB camera indices and names. `teleop` and
+`record` read this file by default and pass it to LeRobot as `--robot.cameras`.
+Use `--no-cameras` for a robot/tactile-only run.
 
 ## Runbook
 
@@ -126,7 +132,7 @@ To override ports at the command line:
 uv run so-tactile teleop --leader-port COM4 --follower-port COM3 --tactile-port COM5
 ```
 
-### 8. Record A Tactile Dataset
+### 8. Record A Visuo-Tactile Dataset
 
 ```powershell
 uv run so-tactile record `
@@ -141,7 +147,7 @@ The command uses LeFlexiTac's `so_tactile_follower` robot and writes
 `observation.tactile.primary` by passing `--robot.tactile_sensors` to
 `lerobot-record`.
 
-`teleop`, `record`, and `replay` show a live tactile heatmap from the same
+`teleop`, `record`, and `replay-live-tactile` show a live tactile heatmap from the same
 LeRobot tactile stream by default. Add `--no-heatmap` to disable the preview for
 one run, or `--heatmap-cell-size 20` to change its size for one run.
 
@@ -164,26 +170,31 @@ uv run so-tactile dataset-path --repo-id local/tactile-smoke
 uv run so-tactile dataset-info --repo-id local/tactile-smoke
 ```
 
-Training datasets are stored under `outputs/datasets/train/`.
+Datasets are stored under `outputs/datasets/captures/`.
 
-### 9. Rollout / Eval Record
-
-```powershell
-uv run so-tactile rollout `
-  --policy-path outputs/train/my_policy/checkpoints/last/pretrained_model `
-  --repo-id local/eval_tactile-smoke `
-  --task "Pick up the object" `
-  --episodes 1
-```
-
-Eval datasets are stored under `outputs/datasets/eval/`. If the repo name does
-not start with `eval_`, `so-tactile rollout` adds it automatically.
-
-Replay an episode on the follower:
+### 9. Replay With Saved Visual/Tactile Data
 
 ```powershell
-uv run so-tactile replay --repo-id local/tactile-smoke --episode 0
+uv run so-tactile replay-recorded --repo-id local/tactile-smoke --episode 0
 ```
+
+`replay-recorded` drives the follower arm from the recorded episode and shows
+the saved camera video and tactile heatmap from the dataset. The robot action,
+image, and tactile frame are advanced in the same loop, so their frame indices
+stay aligned.
+
+`replay-recorded` does not connect the current tactile sensor or show the live
+tactile stream. It only shows tactile values saved in the dataset.
+
+Replay an episode on the follower with the live tactile stream:
+
+```powershell
+uv run so-tactile replay-live-tactile --repo-id local/tactile-smoke --episode 0
+```
+
+`replay-live-tactile` drives the follower arm and shows the current tactile stream from
+the sensor. `replay-recorded` drives the follower arm and shows the visual and
+tactile data saved in the dataset.
 
 ## Development
 

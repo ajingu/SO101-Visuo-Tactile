@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from datetime import UTC
 from pathlib import Path
 from typing import Any
@@ -22,8 +23,8 @@ DEFAULT_ROBOT_CALIBRATION_DIR = PROJECT_ROOT / "calibration" / "robot"
 DEFAULT_PORTS_CONFIG_PATH = PROJECT_ROOT / "configs" / "ports.json"
 DEFAULT_CAMERAS_CONFIG_PATH = PROJECT_ROOT / "configs" / "cameras.json"
 DEFAULT_DATASET_DIR = PROJECT_ROOT / "outputs" / "datasets"
-DEFAULT_TRAIN_DATASET_DIR = DEFAULT_DATASET_DIR / "train"
-DEFAULT_EVAL_DATASET_DIR = DEFAULT_DATASET_DIR / "eval"
+DEFAULT_CAPTURE_DATASET_DIR = DEFAULT_DATASET_DIR / "captures"
+LEGACY_TRAIN_DATASET_DIR = DEFAULT_DATASET_DIR / "train"
 CV2_BACKEND_CODES = {
     "ANY": 0,
     "V4L2": 200,
@@ -168,10 +169,7 @@ def robot_calibration_dir(
 
 
 def dataset_root_for_repo(repo_id: str) -> Path:
-    _, _, name = repo_id.rpartition("/")
-    if name.startswith("eval_"):
-        return DEFAULT_EVAL_DATASET_DIR
-    return DEFAULT_TRAIN_DATASET_DIR
+    return DEFAULT_CAPTURE_DATASET_DIR
 
 
 def lerobot_dataset_path(repo_id: str, dataset_root: str | None = None) -> Path:
@@ -209,8 +207,8 @@ def find_lerobot_dataset_path(repo_id: str) -> Path:
         return preferred_path
 
     candidates = [
-        DEFAULT_TRAIN_DATASET_DIR / Path(repo_id),
-        DEFAULT_EVAL_DATASET_DIR / Path(repo_id),
+        DEFAULT_CAPTURE_DATASET_DIR / Path(repo_id),
+        LEGACY_TRAIN_DATASET_DIR / Path(repo_id),
         DEFAULT_DATASET_DIR / Path(repo_id),
     ]
     for candidate in candidates:
@@ -218,14 +216,6 @@ def find_lerobot_dataset_path(repo_id: str) -> Path:
             return candidate
 
     return preferred_path
-
-
-def eval_repo_id(repo_id: str) -> str:
-    namespace, separator, name = repo_id.rpartition("/")
-    if name.startswith("eval_"):
-        return repo_id
-    eval_name = f"eval_{name}"
-    return f"{namespace}{separator}{eval_name}" if separator else eval_name
 
 
 def tactile_sensors_arg(
@@ -640,53 +630,25 @@ def record_command(args: argparse.Namespace) -> int:
     return run_or_print(command, dry_run=args.dry_run, env_overrides=lerobot_env(ports_config, args))
 
 
-def rollout_command(args: argparse.Namespace) -> int:
+def replay_live_command(args: argparse.Namespace) -> int:
     ports_config = load_ports_config(args.ports_config)
-    cameras_arg = robot_cameras_arg(args)
-    repo_id = eval_repo_id(args.repo_id)
-    if repo_id != args.repo_id:
-        print(f"Using eval repo_id: {repo_id}")
-    dataset_path = lerobot_dataset_path(repo_id, args.dataset_root)
-    if args.overwrite:
-        remove_existing_dataset(repo_id, args.dataset_root, dry_run=args.dry_run)
-    command = [
-        *lerobot_command("record"),
-        *base_robot_args(
-            args,
-            ports_config=ports_config,
-            include_leader=args.with_teleop,
-            include_tactile=not args.no_tactile,
-        ),
-        f"--display_data={str(args.display_data).lower()}",
-        "--play_sounds=false",
-        f"--dataset.repo_id={repo_id}",
-        f"--dataset.root={dataset_path}",
-        f"--dataset.num_episodes={args.episodes}",
-        f"--dataset.episode_time_s={args.episode_time_s}",
-        f"--dataset.reset_time_s={args.reset_time_s}",
-        f"--dataset.single_task={args.task}",
-        f"--dataset.fps={args.fps}",
-        "--dataset.push_to_hub=false",
-        f"--policy.path={args.policy_path}",
-    ]
-    if cameras_arg:
-        command.append(f"--robot.cameras={cameras_arg}")
-    if args.device:
-        command.append(f"--policy.device={args.device}")
-    if args.use_amp is not None:
-        command.append(f"--policy.use_amp={str(args.use_amp).lower()}")
+    command = replay_robot_command(args, ports_config)
+    add_tactile_sensor_arg_from_config(command, args, ports_config)
     return run_or_print(command, dry_run=args.dry_run, env_overrides=lerobot_env(ports_config, args))
 
 
-def replay_command(args: argparse.Namespace) -> int:
-    ports_config = load_ports_config(args.ports_config)
+def replay_robot_command(args: argparse.Namespace, ports_config: dict[str, Any]) -> list[str]:
     follower_port = require_value(
         config_value(args.follower_port, ports_config, "follower", "port"),
         "follower port",
     )
     follower_id = config_value(args.follower_id, ports_config, "follower", "id", "follower")
     calib_dir = robot_calibration_dir(args.calibration_dir, ports_config)
-    dataset_path = lerobot_dataset_path(args.repo_id, args.dataset_root)
+    dataset_path = (
+        lerobot_dataset_path(args.repo_id, args.dataset_root)
+        if args.dataset_root
+        else find_lerobot_dataset_path(args.repo_id)
+    )
     command = [
         *lerobot_command("replay"),
         "--robot.type=so_tactile_follower",
@@ -697,8 +659,272 @@ def replay_command(args: argparse.Namespace) -> int:
         f"--dataset.root={dataset_path}",
         f"--dataset.episode={args.episode}",
     ]
-    add_tactile_sensor_arg_from_config(command, args, ports_config)
-    return run_or_print(command, dry_run=args.dry_run, env_overrides=lerobot_env(ports_config, args))
+    return command
+
+
+def replay_recorded_command(args: argparse.Namespace) -> int:
+    import cv2
+
+    from lerobot.processor import make_default_robot_action_processor
+    from lerobot.utils.import_utils import register_third_party_plugins
+    from lerobot.utils.robot_utils import precise_sleep
+
+    from so_tactile.lerobot_run import install_park_on_disconnect
+
+    ports_config = load_ports_config(args.ports_config)
+    follower_port = require_value(
+        config_value(args.follower_port, ports_config, "follower", "port"),
+        "follower port",
+    )
+    follower_id = config_value(args.follower_id, ports_config, "follower", "id", "follower")
+    calib_dir = robot_calibration_dir(args.calibration_dir, ports_config)
+    dataset_path, info, episode_row, data = load_recorded_episode(args)
+    features = info.get("features", {})
+    action_names = features.get("action", {}).get("names")
+    if not action_names:
+        raise ValueError(f"Dataset action names not found: {dataset_path / 'meta' / 'info.json'}")
+
+    video_keys = [
+        key for key, value in features.items()
+        if isinstance(value, dict) and value.get("dtype") == "video"
+    ]
+    tactile_keys = [key for key in features if key.startswith("observation.tactile.")]
+    video_key = args.video_key or (video_keys[0] if video_keys else None)
+    tactile_key = args.tactile_key or (tactile_keys[0] if tactile_keys else None)
+    fps = float(args.fps or info.get("fps") or 30)
+    max_frames = min(len(data), args.frames) if args.frames else len(data)
+
+    print(f"dataset: {dataset_path}")
+    print(f"episode: {args.episode}")
+    print(f"frames: {len(data)}")
+    print(f"video: {video_key or 'none'}")
+    print(f"tactile: {tactile_key or 'none'}")
+    if args.dry_run:
+        print(f"robot: so_tactile_follower port={follower_port} id={follower_id} calibration_dir={calib_dir}")
+        print("current tactile sensor: disabled")
+        return 0
+
+    register_third_party_plugins()
+    from lerobot.robots import SOTactileFollower, SOTactileFollowerConfig
+
+    os.environ.update(lerobot_env(ports_config, args))
+    install_park_on_disconnect()
+
+    robot_action_processor = make_default_robot_action_processor()
+    robot = SOTactileFollower(
+        SOTactileFollowerConfig(
+            port=follower_port,
+            id=follower_id,
+            calibration_dir=Path(calib_dir),
+            tactile_sensors={},
+        )
+    )
+    video_reader = open_episode_video_reader(dataset_path, episode_row, video_key, features, info) if video_key else None
+    tactile_max = tactile_recorded_max(data, tactile_key) if tactile_key else 1.0
+
+    robot.connect()
+    try:
+        for row_index in range(max_frames):
+            started = time.perf_counter()
+            action_array = data["action"].iloc[row_index]
+            action = {
+                name: float(action_array[action_index])
+                for action_index, name in enumerate(action_names)
+            }
+            robot_obs = robot.get_observation()
+            processed_action = robot_action_processor((action, robot_obs))
+            robot.send_action(processed_action)
+
+            display_index = min(max(row_index + args.media_offset_frames, 0), len(data) - 1)
+            display_recorded_frame(
+                args,
+                data,
+                display_index,
+                video_reader,
+                video_key,
+                tactile_key,
+                tactile_max,
+            )
+
+            key = cv2.waitKey(1) & 0xFF
+            if key in {ord("q"), 27}:
+                break
+            dt_s = time.perf_counter() - started
+            precise_sleep(max(1 / fps - dt_s, 0.0))
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        return 130
+    finally:
+        robot.disconnect()
+        if video_reader is not None:
+            video_reader.close()
+        cv2.destroyAllWindows()
+
+    return 0
+
+
+def load_recorded_episode(args: argparse.Namespace) -> tuple[Path, dict[str, Any], Any, Any]:
+    import pandas as pd
+
+    dataset_path = (
+        lerobot_dataset_path(args.repo_id, args.dataset_root)
+        if args.dataset_root
+        else find_lerobot_dataset_path(args.repo_id)
+    )
+    info_path = dataset_path / "meta" / "info.json"
+    if not info_path.exists():
+        raise FileNotFoundError(f"Dataset info not found: {info_path}")
+
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    episode_row = read_episode_row(dataset_path, args.episode)
+    data_path = dataset_path / "data" / f"chunk-{int(episode_row['data/chunk_index']):03d}" / (
+        f"file-{int(episode_row['data/file_index']):03d}.parquet"
+    )
+    data = pd.read_parquet(data_path)
+    data = data[data["episode_index"] == args.episode].reset_index(drop=True)
+    if data.empty:
+        raise ValueError(f"No frames for episode {args.episode} in {data_path}")
+    return dataset_path, info, episode_row, data
+
+
+def open_episode_video_reader(
+    dataset_path: Path,
+    episode_row: Any,
+    video_key: str,
+    features: dict[str, Any],
+    info: dict[str, Any],
+) -> VideoReader | None:
+    video_path = episode_video_path(dataset_path, episode_row, video_key)
+    video_fps = video_feature_fps(features[video_key], info)
+    from_timestamp = float(episode_row.get(f"videos/{video_key}/from_timestamp", 0.0))
+    frame_offset = max(0, round(from_timestamp * video_fps))
+    video_reader = open_video_reader(video_path, frame_offset)
+    if video_reader is None:
+        print(f"Failed to open video: {video_path}", file=sys.stderr)
+    else:
+        print(f"video: {video_key} ({video_path})")
+    return video_reader
+
+
+def display_recorded_frame(
+    args: argparse.Namespace,
+    data: Any,
+    row_index: int,
+    video_reader: VideoReader | None,
+    video_key: str | None,
+    tactile_key: str | None,
+    tactile_max: float,
+) -> None:
+    import cv2
+
+    if video_reader is not None and video_key is not None:
+        image = video_reader.read(row_index)
+        if image is not None:
+            cv2.imshow(f"{args.repo_id} {video_key}", image)
+    if tactile_key:
+        heatmap = tactile_heatmap_image(data[tactile_key].iloc[row_index], tactile_max, args.cell_size)
+        cv2.imshow(f"{args.repo_id} {tactile_key}", heatmap)
+
+
+class VideoReader:
+    def __init__(self, backend: Any, *, frame_offset: int = 0, uses_rgb: bool = False) -> None:
+        self.backend = backend
+        self.frame_offset = frame_offset
+        self.uses_rgb = uses_rgb
+
+    def read(self, row_index: int) -> Any:
+        if hasattr(self.backend, "get_data"):
+            try:
+                image = self.backend.get_data(self.frame_offset + row_index)
+            except (IndexError, RuntimeError, OSError):
+                return None
+            if self.uses_rgb:
+                image = image[..., ::-1]
+            return image
+
+        import cv2
+
+        self.backend.set(cv2.CAP_PROP_POS_FRAMES, self.frame_offset + row_index)
+        ok, image = self.backend.read()
+        return image if ok else None
+
+    def close(self) -> None:
+        if hasattr(self.backend, "close"):
+            self.backend.close()
+        elif hasattr(self.backend, "release"):
+            self.backend.release()
+
+
+def open_video_reader(video_path: Path, frame_offset: int) -> VideoReader | None:
+    import cv2
+
+    cap = cv2.VideoCapture(str(video_path))
+    if cap.isOpened():
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_offset)
+        return VideoReader(cap)
+    cap.release()
+
+    try:
+        import imageio.v2 as imageio
+
+        reader = imageio.get_reader(str(video_path))
+        return VideoReader(reader, frame_offset=frame_offset, uses_rgb=True)
+    except Exception:
+        return None
+
+
+def read_episode_row(dataset_path: Path, episode: int) -> Any:
+    import pandas as pd
+
+    episode_files = sorted((dataset_path / "meta" / "episodes").glob("chunk-*/file-*.parquet"))
+    if not episode_files:
+        raise FileNotFoundError(f"No episode metadata found under {dataset_path / 'meta' / 'episodes'}")
+    episodes = pd.concat([pd.read_parquet(path) for path in episode_files], ignore_index=True)
+    matches = episodes[episodes["episode_index"] == episode]
+    if matches.empty:
+        raise ValueError(f"Episode {episode} not found in {dataset_path}")
+    return matches.iloc[0]
+
+
+def episode_video_path(dataset_path: Path, episode_row: Any, video_key: str) -> Path:
+    chunk_key = f"videos/{video_key}/chunk_index"
+    file_key = f"videos/{video_key}/file_index"
+    if chunk_key in episode_row and file_key in episode_row:
+        return dataset_path / "videos" / video_key / f"chunk-{int(episode_row[chunk_key]):03d}" / (
+            f"file-{int(episode_row[file_key]):03d}.mp4"
+        )
+    return dataset_path / "videos" / video_key / "chunk-000" / "file-000.mp4"
+
+
+def video_feature_fps(feature: dict[str, Any], info: dict[str, Any]) -> float:
+    video_info = feature.get("info", {})
+    return float(video_info.get("video.fps") or info.get("fps") or 30)
+
+
+def tactile_recorded_max(data: Any, tactile_key: str) -> float:
+    values = [float(np.max(tactile_frame_array(value))) for value in data[tactile_key]]
+    return max(max(values, default=1.0), 1.0)
+
+
+def tactile_heatmap_image(value: Any, tactile_max: float, cell_size: int) -> Any:
+    import cv2
+
+    frame = tactile_frame_array(value)
+    normalized = np.clip(frame / tactile_max, 0.0, 1.0)
+    gray = (normalized * 255).astype(np.uint8)
+    heatmap = cv2.applyColorMap(gray, cv2.COLORMAP_VIRIDIS)
+    return cv2.resize(
+        heatmap,
+        (frame.shape[1] * cell_size, frame.shape[0] * cell_size),
+        interpolation=cv2.INTER_NEAREST,
+    )
+
+
+def tactile_frame_array(value: Any) -> Any:
+    frame = np.asarray(value)
+    if frame.dtype == object:
+        frame = np.vstack(frame)
+    return np.asarray(frame, dtype=np.float32)
 
 
 def dataset_path_command(args: argparse.Namespace) -> int:
@@ -790,6 +1016,27 @@ def add_common_tactile_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--baseline-path")
 
 
+def add_replay_args(parser: argparse.ArgumentParser, *, include_tactile: bool = True) -> None:
+    add_ports_config_arg(parser)
+    parser.add_argument("--follower-port")
+    parser.add_argument("--follower-id")
+    parser.add_argument("--calibration-dir")
+    if include_tactile:
+        parser.add_argument("--tactile-port")
+        parser.add_argument("--tactile-name")
+        parser.add_argument("--tactile-baud-rate", type=int)
+        parser.add_argument("--no-tactile", action="store_true")
+        parser.add_argument("--no-heatmap", action="store_true")
+        parser.add_argument("--heatmap-cell-size", type=int)
+    parser.add_argument("--no-park-on-exit", action="store_false", dest="park_on_exit")
+    parser.add_argument("--park-duration-s", type=float)
+    parser.add_argument("--repo-id", required=True)
+    parser.add_argument("--dataset-root")
+    parser.add_argument("--episode", type=int, default=0)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.set_defaults(park_on_exit=True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="so-tactile")
     subparsers = parser.add_subparsers(dest="command")
@@ -875,47 +1122,19 @@ def build_parser() -> argparse.ArgumentParser:
     record_parser.set_defaults(streaming_encoding=True)
     record_parser.set_defaults(func=record_command)
 
-    rollout_parser = subparsers.add_parser("rollout")
-    add_robot_port_args(rollout_parser)
-    add_cameras_config_args(rollout_parser)
-    rollout_parser.add_argument("--policy-path", required=True)
-    rollout_parser.add_argument("--repo-id", required=True)
-    rollout_parser.add_argument("--task", default="Pick up the object")
-    rollout_parser.add_argument("--dataset-root")
-    rollout_parser.add_argument("--episodes", type=int, default=3)
-    rollout_parser.add_argument("--episode-time-s", type=int, default=30)
-    rollout_parser.add_argument("--reset-time-s", type=int, default=15)
-    rollout_parser.add_argument("--fps", type=int, default=30)
-    rollout_parser.add_argument("--with-teleop", action="store_true")
-    rollout_parser.add_argument("--overwrite", action="store_true")
-    rollout_parser.add_argument("--device", default="cuda")
-    rollout_parser.add_argument("--no-use-amp", action="store_false", dest="use_amp")
-    display_group = rollout_parser.add_mutually_exclusive_group()
-    display_group.add_argument("--display-data", action="store_true", dest="display_data")
-    display_group.add_argument("--no-display-data", action="store_false", dest="display_data")
-    rollout_parser.set_defaults(display_data=True)
-    rollout_parser.set_defaults(use_amp=True)
-    rollout_parser.set_defaults(func=rollout_command)
+    replay_live_parser = subparsers.add_parser("replay-live-tactile")
+    add_replay_args(replay_live_parser)
+    replay_live_parser.set_defaults(func=replay_live_command)
 
-    replay_parser = subparsers.add_parser("replay")
-    add_ports_config_arg(replay_parser)
-    replay_parser.add_argument("--follower-port")
-    replay_parser.add_argument("--follower-id")
-    replay_parser.add_argument("--calibration-dir")
-    replay_parser.add_argument("--tactile-port")
-    replay_parser.add_argument("--tactile-name")
-    replay_parser.add_argument("--tactile-baud-rate", type=int)
-    replay_parser.add_argument("--no-tactile", action="store_true")
-    replay_parser.add_argument("--no-heatmap", action="store_true")
-    replay_parser.add_argument("--heatmap-cell-size", type=int)
-    replay_parser.add_argument("--no-park-on-exit", action="store_false", dest="park_on_exit")
-    replay_parser.add_argument("--park-duration-s", type=float)
-    replay_parser.add_argument("--repo-id", required=True)
-    replay_parser.add_argument("--dataset-root")
-    replay_parser.add_argument("--episode", type=int, default=0)
-    replay_parser.add_argument("--dry-run", action="store_true")
-    replay_parser.set_defaults(park_on_exit=True)
-    replay_parser.set_defaults(func=replay_command)
+    replay_recorded_parser = subparsers.add_parser("replay-recorded")
+    add_replay_args(replay_recorded_parser, include_tactile=False)
+    replay_recorded_parser.add_argument("--video-key")
+    replay_recorded_parser.add_argument("--tactile-key")
+    replay_recorded_parser.add_argument("--fps", type=float)
+    replay_recorded_parser.add_argument("--frames", type=int)
+    replay_recorded_parser.add_argument("--cell-size", type=int, default=25)
+    replay_recorded_parser.add_argument("--media-offset-frames", type=int, default=0)
+    replay_recorded_parser.set_defaults(func=replay_recorded_command)
 
     dataset_path_parser = subparsers.add_parser("dataset-path")
     dataset_path_parser.add_argument("--repo-id", required=True)
@@ -951,6 +1170,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     try:
         return args.func(args)
-    except (RuntimeError, ValueError) as exc:
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
