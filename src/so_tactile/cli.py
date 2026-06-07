@@ -826,6 +826,198 @@ def display_recorded_frame(
         cv2.imshow(f"{args.repo_id} {tactile_key}", heatmap)
 
 
+def export_recorded_media_command(args: argparse.Namespace) -> int:
+    import cv2
+
+    dataset_path, info, episode_row, data = load_recorded_episode(args)
+    features = info.get("features", {})
+    video_keys = [
+        key for key, value in features.items()
+        if isinstance(value, dict) and value.get("dtype") == "video"
+    ]
+    tactile_keys = [key for key in features if key.startswith("observation.tactile.")]
+    video_key = args.video_key or (video_keys[0] if video_keys else None)
+    tactile_key = args.tactile_key or (tactile_keys[0] if tactile_keys else None)
+    if video_key is None and tactile_key is None:
+        raise ValueError("Dataset has neither video nor tactile features to export")
+
+    fps = float(args.fps or info.get("fps") or 30)
+    max_frames = min(len(data), args.frames) if args.frames else len(data)
+    output_path = recorded_media_output_path(args)
+    output_is_gif = recorded_media_output_is_gif(args, output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    video_reader = (
+        open_episode_video_reader(dataset_path, episode_row, video_key, features, info)
+        if video_key
+        else None
+    )
+    tactile_max = tactile_recorded_max(data, tactile_key) if tactile_key else 1.0
+    writer = None
+    gif_frames = []
+    try:
+        for row_index in range(max_frames):
+            display_index = min(max(row_index + args.media_offset_frames, 0), len(data) - 1)
+            frame = compose_recorded_frame(
+                args,
+                data,
+                display_index,
+                video_reader,
+                video_key,
+                tactile_key,
+                tactile_max,
+            )
+            if output_is_gif:
+                gif_frames.append(frame[..., ::-1])
+                continue
+            if writer is None:
+                height, width = frame.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*args.fourcc)
+                writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+                if not writer.isOpened():
+                    raise RuntimeError(f"Failed to open video writer: {output_path}")
+            writer.write(frame)
+    finally:
+        if writer is not None:
+            writer.release()
+        if video_reader is not None:
+            video_reader.close()
+
+    if output_is_gif:
+        import imageio.v2 as imageio
+
+        imageio.mimsave(str(output_path), gif_frames, fps=fps)
+
+    print(f"exported: {output_path}")
+    print(f"frames: {max_frames}")
+    print(f"video: {video_key or 'none'}")
+    print(f"tactile: {tactile_key or 'none'}")
+    return 0
+
+
+def recorded_media_output_path(args: argparse.Namespace) -> Path:
+    if args.output:
+        return Path(args.output)
+    repo_name = str(args.repo_id).replace("/", "_").replace("\\", "_")
+    suffix = ".gif" if args.gif else ".mp4"
+    return PROJECT_ROOT / "outputs" / "replays" / f"{repo_name}_episode-{args.episode:03d}{suffix}"
+
+
+def recorded_media_output_is_gif(args: argparse.Namespace, output_path: Path) -> bool:
+    suffix = output_path.suffix.lower()
+    if args.gif and suffix and suffix != ".gif":
+        raise ValueError("--gif requires an output path ending in .gif")
+    return args.gif or suffix == ".gif"
+
+
+def compose_recorded_frame(
+    args: argparse.Namespace,
+    data: Any,
+    row_index: int,
+    video_reader: VideoReader | None,
+    video_key: str | None,
+    tactile_key: str | None,
+    tactile_max: float,
+) -> Any:
+    import cv2
+
+    panels = []
+    labels = []
+    if video_reader is not None and video_key is not None:
+        image = video_reader.read(row_index)
+        if image is not None:
+            panels.append(image)
+            labels.append(video_key)
+    if tactile_key:
+        heatmap = tactile_heatmap_image(
+            data[tactile_key].iloc[row_index],
+            tactile_max,
+            args.cell_size,
+        )
+        panels.append(heatmap)
+        labels.append(tactile_key)
+    if not panels:
+        raise RuntimeError(f"No media frame available at row {row_index}")
+
+    if args.layout == "vertical":
+        return stack_recorded_panels_vertical(panels, labels, args)
+    return stack_recorded_panels_horizontal(panels, labels, args)
+
+
+def stack_recorded_panels_vertical(panels: list[Any], labels: list[str], args: argparse.Namespace) -> Any:
+    video_panel = resize_to_height(panels[0], max(1, int(args.video_height)))
+    stacked_panels = [video_panel]
+    target_width = video_panel.shape[1]
+    for panel in panels[1:]:
+        stacked_panels.append(resize_to_width(panel, target_width))
+    if args.labels:
+        stacked_panels = [
+            add_panel_label(panel, label)
+            for panel, label in zip(stacked_panels, labels, strict=True)
+        ]
+
+    separator = np.full((int(args.gap), target_width, 3), 24, dtype=np.uint8)
+    frame = stacked_panels[0]
+    for panel in stacked_panels[1:]:
+        if panel.shape[1] != frame.shape[1]:
+            panel = resize_to_width(panel, frame.shape[1])
+        frame = np.vstack([frame, separator, panel])
+    return frame
+
+
+def stack_recorded_panels_horizontal(panels: list[Any], labels: list[str], args: argparse.Namespace) -> Any:
+    target_height = max(1, int(args.panel_height))
+    panels = [resize_to_height(panel, target_height) for panel in panels]
+    if args.labels:
+        panels = [add_panel_label(panel, label) for panel, label in zip(panels, labels, strict=True)]
+
+    separator = np.full((panels[0].shape[0], int(args.gap), 3), 24, dtype=np.uint8)
+    frame = panels[0]
+    for panel in panels[1:]:
+        if panel.shape[0] != frame.shape[0]:
+            panel = resize_to_height(panel, frame.shape[0])
+        frame = np.hstack([frame, separator, panel])
+    return frame
+
+
+def resize_to_width(image: Any, width: int) -> Any:
+    import cv2
+
+    current_height, current_width = image.shape[:2]
+    if current_width == width:
+        return image
+    height = max(1, round(current_height * width / current_width))
+    return cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
+
+
+def resize_to_height(image: Any, height: int) -> Any:
+    import cv2
+
+    current_height, current_width = image.shape[:2]
+    if current_height == height:
+        return image
+    width = max(1, round(current_width * height / current_height))
+    return cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
+
+
+def add_panel_label(image: Any, label: str) -> Any:
+    import cv2
+
+    labeled = image.copy()
+    cv2.rectangle(labeled, (0, 0), (labeled.shape[1], 32), (0, 0, 0), thickness=-1)
+    cv2.putText(
+        labeled,
+        label,
+        (10, 22),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    return labeled
+
+
 class VideoReader:
     def __init__(self, backend: Any, *, frame_offset: int = 0, uses_rgb: bool = False) -> None:
         self.backend = backend
@@ -1135,6 +1327,31 @@ def build_parser() -> argparse.ArgumentParser:
     replay_recorded_parser.add_argument("--cell-size", type=int, default=25)
     replay_recorded_parser.add_argument("--media-offset-frames", type=int, default=0)
     replay_recorded_parser.set_defaults(func=replay_recorded_command)
+
+    export_recorded_parser = subparsers.add_parser("export-recorded-media")
+    export_recorded_parser.add_argument("--repo-id", required=True)
+    export_recorded_parser.add_argument("--dataset-root")
+    export_recorded_parser.add_argument("--episode", type=int, default=0)
+    export_recorded_parser.add_argument("--video-key")
+    export_recorded_parser.add_argument("--tactile-key")
+    export_recorded_parser.add_argument("--fps", type=float)
+    export_recorded_parser.add_argument("--frames", type=int)
+    export_recorded_parser.add_argument("--cell-size", type=int, default=25)
+    export_recorded_parser.add_argument("--media-offset-frames", type=int, default=0)
+    export_recorded_parser.add_argument("--output")
+    export_recorded_parser.add_argument("--gif", action="store_true")
+    export_recorded_parser.add_argument(
+        "--layout",
+        choices=["vertical", "horizontal"],
+        default="vertical",
+    )
+    export_recorded_parser.add_argument("--panel-height", type=int, default=480)
+    export_recorded_parser.add_argument("--video-height", type=int, default=720)
+    export_recorded_parser.add_argument("--gap", type=int, default=8)
+    export_recorded_parser.add_argument("--fourcc", default="mp4v")
+    export_recorded_parser.add_argument("--no-labels", action="store_false", dest="labels")
+    export_recorded_parser.set_defaults(labels=True)
+    export_recorded_parser.set_defaults(func=export_recorded_media_command)
 
     dataset_path_parser = subparsers.add_parser("dataset-path")
     dataset_path_parser.add_argument("--repo-id", required=True)
