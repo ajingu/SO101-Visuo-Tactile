@@ -6,6 +6,12 @@ SO-ARM visuo-tactile sensing with [FlexiTac](https://flexitac.github.io/).
 
 [Visuo-tactile replay video](artifacts/tactile-smoke-episode-0.mp4)
 
+
+
+https://github.com/user-attachments/assets/4a1dc353-89ac-4ac9-8d19-d3abdd2b7df4
+
+
+
 This repo records synchronized SO-ARM camera and FlexiTac tactile observations,
 shows live tactile heatmaps, and replays saved visual/tactile episodes.
 
