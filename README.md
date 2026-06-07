@@ -4,11 +4,12 @@ SO-ARM visuo-tactile sensing with [FlexiTac](https://flexitac.github.io/).
 
 ![SO-ARM tactile sensor](artifacts/SO-ARM_tactile-sensor.jpeg)
 
-[Visuo-tactile replay video](artifacts/tactile-smoke-episode-0.mp4)
+<img width="1215" height="334" alt="image" src="https://github.com/user-attachments/assets/e1fe0754-11dd-4671-8b0b-4a28dca0d955" />
 
 
 
-https://github.com/user-attachments/assets/4a1dc353-89ac-4ac9-8d19-d3abdd2b7df4
+https://github.com/user-attachments/assets/42f5a9c9-d14f-4b28-9800-8e4c0a5b5df7
+
 
 
 
@@ -88,12 +89,6 @@ uv run so-tactile replay-live-tactile --repo-id local/tactile-smoke --episode 0
 `replay-recorded` uses saved camera/tactile data. `replay-live-tactile` drives
 the follower while showing the current tactile stream.
 
-## Development
-
-```powershell
-uv run pre-commit install
-uv run pre-commit run --all-files
-```
 
 ## Links
 
